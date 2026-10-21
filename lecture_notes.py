@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-lecture_notes.py — turn a YouTube lecture into study notes on a Notion page.
+lecture_notes.py — turn a YouTube lecture into study notes: a Markdown page in this repo, plus a Notion page.
 
 Pipeline:
   1. Fetch the video's transcript (captions) from YouTube.
   2. Ask Claude to write structured notes, optionally weaving in your own notes.
-  3. Create a Notion page with the notes, every timestamp linking back to
-     that moment in the video.
+  3. Save them as photonics/<date>-<title>.md in this repo (ready to commit and push),
+     and create a Notion page if Notion is set up. Every timestamp links back to that
+     moment in the video. No transcript unless you ask.
 
 Usage:
   python lecture_notes.py "https://www.youtube.com/watch?v=VIDEO_ID"
   python lecture_notes.py URL --my-notes my_notes.txt     # merge your own notes
-  python lecture_notes.py URL --lang de en                # prefer German captions
-  python lecture_notes.py URL --dry-run                   # print notes, skip Notion
+  python lecture_notes.py URL --lang de en                # prefer German captions (notes stay English)
+  python lecture_notes.py URL --notes-lang German         # write the notes in German
+  python lecture_notes.py URL --with-transcript           # also attach the full transcript
+  python lecture_notes.py URL --folder optics             # repo folder for this run
+  python lecture_notes.py URL --no-notion                 # Markdown page only this time
+  python lecture_notes.py URL --dry-run                   # print notes, publish nowhere
 
 Environment (put these in a .env file next to this script, or export them):
   ANTHROPIC_API_KEY       your Claude API key
@@ -82,13 +87,24 @@ def fetch_transcript(video_id: str, languages: list[str]) -> list[dict]:
     try:
         fetched = api.fetch(video_id, languages=languages)
     except Exception:
-        # Preferred languages missing: take whatever exists (manual first, then auto).
+        # Preferred languages missing: take whatever exists (manual first, then auto),
+        # asking YouTube to translate it to the first preferred language when it can.
         transcripts = list(api.list(video_id))
         if not transcripts:
             raise
         transcripts.sort(key=lambda t: t.is_generated)
-        fetched = transcripts[0].fetch()
-        print(f"  (no {languages} captions; using {fetched.language})", file=sys.stderr)
+        original = transcripts[0]
+        target = languages[0]
+        try:
+            if not original.is_translatable:
+                raise ValueError
+            fetched = original.translate(target).fetch()
+            print(f"  (no {target} captions; using YouTube's {target} translation of {original.language})",
+                  file=sys.stderr)
+        except Exception:
+            fetched = original.fetch()
+            print(f"  (no {target} captions; using {fetched.language}; notes are still written in your notes language)",
+                  file=sys.stderr)
     return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
 
 
@@ -135,7 +151,10 @@ def fetch_title(video_id: str) -> str | None:
 NOTES_SCHEMA = {
     "type": "object",
     "properties": {
-        "title": {"type": "string", "description": "Short, clear title for the notes page."},
+        "title": {"type": "string", "description": (
+            "Precise title naming the lecture's main topic in 2-6 words, e.g. 'Introduction to Lasers' "
+            "or 'Fabry-Perot Resonators'. No subtitle, no list of subtopics, no colon, no course or "
+            "lecture number. It also becomes the page's file name.")},
         "summary": {"type": "string", "description": "2-4 sentence overview of what the lecture covers and its central idea."},
         "key_concepts": {
             "type": "array",
@@ -195,30 +214,46 @@ Write notes that help them understand and remember, not a transcript rewrite.
   important or confusing, and connect each one to the relevant part of the lecture."""
 
 
-def make_notes(transcript: str, video_title: str | None, my_notes: str | None, model: str) -> dict:
+def make_notes(transcript: str, video_title: str | None, my_notes: str | None, model: str,
+               notes_lang: str = "English") -> dict:
     import anthropic
 
     client = anthropic.Anthropic()
+    system = SYSTEM_PROMPT + (
+        f"\n- Write every part of the notes in {notes_lang}, even if the transcript or the "
+        f"learner's notes are in another language. Keep technical terms recognisable; if a key "
+        f"term was said in another language, give the {notes_lang} term with the original in brackets."
+    )
     user_msg = f"Lecture: {video_title or 'Untitled YouTube lecture'}\n\n<transcript>\n{transcript}\n</transcript>"
     if my_notes:
         user_msg += f"\n\n<my_notes>\n{my_notes}\n</my_notes>"
 
+    # Structured outputs: the reply is JSON guaranteed to match NOTES_SCHEMA.
     resp = client.messages.create(
         model=model,
-        max_tokens=8000,
-        system=SYSTEM_PROMPT,
-        tools=[{
-            "name": "save_lecture_notes",
-            "description": "Save the structured notes for this lecture.",
-            "input_schema": NOTES_SCHEMA,
-        }],
-        tool_choice={"type": "tool", "name": "save_lecture_notes"},
+        max_tokens=16000,
+        system=system,
+        output_config={"format": {"type": "json_schema", "schema": strict_schema(NOTES_SCHEMA)}},
         messages=[{"role": "user", "content": user_msg}],
     )
-    for block in resp.content:
-        if block.type == "tool_use":
-            return block.input
-    raise RuntimeError("Claude didn't return notes; try again.")
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError("Notes were cut off before finishing; raise max_tokens in make_notes() and retry.")
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Claude's reply wasn't valid JSON (stop_reason={resp.stop_reason}):\n{text[:500]}")
+
+
+def strict_schema(schema: dict) -> dict:
+    """Structured outputs require additionalProperties: false on every object."""
+    s = dict(schema)
+    if s.get("type") == "object":
+        s["additionalProperties"] = False
+        s["properties"] = {k: strict_schema(v) for k, v in s.get("properties", {}).items()}
+    if s.get("type") == "array" and "items" in s:
+        s["items"] = strict_schema(s["items"])
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +363,95 @@ def create_notion_page(notes: dict, blocks: list[dict], parent_id: str, video_id
 
 
 # ---------------------------------------------------------------------------
+# 4. Markdown page in the repo (commit and push it yourself)
+# ---------------------------------------------------------------------------
+
+
+def ts_md(video_id: str, seconds: int) -> str:
+    return f"[{fmt_ts(seconds)}](https://www.youtube.com/watch?v={video_id}&t={int(seconds)}s)"
+
+
+def build_markdown(notes: dict, video_id: str, video_title: str | None, snippets: list[dict],
+                   include_transcript: bool) -> str:
+    from datetime import date
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    md = [f"# {notes['title']}", ""]
+    md += [f"**Lecture:** [{video_title or url}]({url})  ", f"**Notes taken:** {date.today().isoformat()}", ""]
+    md += [f"[![Watch on YouTube](https://img.youtube.com/vi/{video_id}/hqdefault.jpg)]({url})", ""]
+    md += [f"> {notes['summary']}", ""]
+
+    if notes.get("key_concepts"):
+        md += ["## Key concepts", ""]
+        md += [f"- **{c['term']}** — {c['explanation']} {ts_md(video_id, c['timestamp_seconds'])}"
+               for c in notes["key_concepts"]]
+        md.append("")
+
+    if notes.get("sections"):
+        md += ["## Walkthrough", ""]
+        for s in notes["sections"]:
+            md += [f"### {s['heading']} {ts_md(video_id, s['timestamp_seconds'])}", ""]
+            md += [f"- {p}" for p in s["points"]]
+            md.append("")
+
+    if notes.get("my_notes_woven_in"):
+        md += ["## My notes, in context", ""]
+        for n in notes["my_notes_woven_in"]:
+            md += [f"> {n['my_note']}", "", n["context"], ""]
+
+    if notes.get("review_questions"):
+        md += ["## Review questions", ""]
+        md += [f"- [ ] {q}" for q in notes["review_questions"]]
+        md.append("")
+
+    if notes.get("open_threads"):
+        md += ["## To look up", ""]
+        md += [f"- {t}" for t in notes["open_threads"]]
+        md.append("")
+
+    if include_transcript:
+        md += ["<details><summary>Full transcript</summary>", "", compact_transcript(snippets, every=60), "", "</details>", ""]
+    return "\n".join(md)
+
+
+def slugify(text: str, max_len: int = 50) -> str:
+    """File-name slug from a title: drops any subtitle (after ':' or a dash) and
+    cuts at a word boundary, so names stay precise and never end mid-word."""
+    text = re.split(r"\s*(?::|\s[—–-]\s)\s*", text.strip(), maxsplit=1)[0] or text
+    s = re.sub(r"[^\w\s-]", "", text.lower(), flags=re.ASCII)
+    s = re.sub(r"[\s_-]+", "-", s).strip("-")
+    if len(s) > max_len:
+        cut = s[:max_len + 1]
+        s = cut[:cut.rfind("-")] if "-" in cut else s[:max_len]
+    return s.strip("-") or "lecture"
+
+
+def repo_root() -> Path:
+    """Root of the git repo this script lives in (falls back to the current folder)."""
+    import subprocess
+
+    for where in (Path(__file__).resolve().parent, Path.cwd()):
+        try:
+            out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=where,
+                                 capture_output=True, text=True, check=True)
+            return Path(out.stdout.strip())
+        except Exception:
+            continue
+    return Path.cwd()
+
+
+def save_markdown(markdown: str, title: str, folder: str) -> Path:
+    """Write <repo>/<folder>/<date>-<title>.md. Re-running the same lecture the same day overwrites it."""
+    from datetime import date
+
+    target = repo_root() / folder.strip("/")
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / f"{date.today().isoformat()}-{slugify(title)}.md"
+    path.write_text(markdown, encoding="utf-8")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -335,20 +459,29 @@ def create_notion_page(notes: dict, blocks: list[dict], parent_id: str, video_id
 def main() -> None:
     load_dotenv(Path(__file__).with_name(".env"))
 
-    ap = argparse.ArgumentParser(description="YouTube lecture → study notes → Notion page")
+    ap = argparse.ArgumentParser(description="YouTube lecture → study notes → Markdown page in this repo (+ Notion)")
     ap.add_argument("url", help="YouTube URL or video ID")
     ap.add_argument("--my-notes", type=Path, help="text file with your own notes to weave in")
-    ap.add_argument("--lang", nargs="+", default=["en"], help="preferred caption languages, in order")
+    ap.add_argument("--lang", nargs="+", default=["en"], help="preferred caption languages, in order (default: en)")
     ap.add_argument("--parent", default=os.environ.get("NOTION_PARENT_PAGE_ID"), help="Notion parent page ID")
-    ap.add_argument("--no-transcript", action="store_true", help="don't attach the full transcript")
-    ap.add_argument("--dry-run", action="store_true", help="print the notes as JSON; don't touch Notion")
+    ap.add_argument("--folder", default=os.environ.get("NOTES_FOLDER", "photonics"),
+                    help="folder in this repo for the Markdown page (default: photonics)")
+    ap.add_argument("--no-notion", action="store_true", help="skip Notion this time")
+    ap.add_argument("--no-markdown", action="store_true", help="skip the Markdown page this time")
+    ap.add_argument("--with-transcript", action="store_true", help="also attach the full transcript (collapsed)")
+    ap.add_argument("--notes-lang", default="English", help="language the notes are written in (default: English)")
+    ap.add_argument("--dry-run", action="store_true", help="print the notes as JSON; publish nowhere")
     ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", DEFAULT_MODEL))
     args = ap.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("Set ANTHROPIC_API_KEY (see .env.example).")
-    if not args.dry_run and not (os.environ.get("NOTION_TOKEN") and args.parent):
-        sys.exit("Set NOTION_TOKEN and NOTION_PARENT_PAGE_ID, or use --dry-run.")
+
+    # Each destination is used when it's configured in .env and not switched off.
+    to_notion = not args.no_notion and bool(os.environ.get("NOTION_TOKEN") and args.parent)
+    to_markdown = not args.no_markdown
+    if not args.dry_run and not (to_notion or to_markdown):
+        sys.exit("Nothing to do: --no-markdown was given and Notion isn't set up in .env.")
 
     video_id = extract_video_id(args.url)
     print("→ Fetching transcript…", file=sys.stderr)
@@ -357,17 +490,40 @@ def main() -> None:
     my_notes = args.my_notes.read_text(encoding="utf-8") if args.my_notes else None
 
     print(f"→ Writing notes with {args.model}…", file=sys.stderr)
-    notes = make_notes(compact_transcript(snippets), title, my_notes, args.model)
+    notes = make_notes(compact_transcript(snippets), title, my_notes, args.model, args.notes_lang)
 
     if args.dry_run:
         print(json.dumps(notes, indent=2, ensure_ascii=False))
         return
 
-    print("→ Creating Notion page…", file=sys.stderr)
-    blocks = build_blocks(notes, video_id, snippets, include_transcript=not args.no_transcript)
-    url = create_notion_page(notes, blocks, args.parent.replace("-", ""), video_id)
-    print(f"✓ Done: {url}")
+    # Publish to each destination independently, so one failing doesn't lose the other.
+    failed = False
+    if to_notion:
+        print("→ Creating Notion page…", file=sys.stderr)
+        try:
+            blocks = build_blocks(notes, video_id, snippets, include_transcript=args.with_transcript)
+            print(f"✓ Notion: {create_notion_page(notes, blocks, args.parent.replace('-', ''), video_id)}")
+        except Exception as e:
+            failed = True
+            print(f"✗ Notion failed: {e}", file=sys.stderr)
+
+    if to_markdown:
+        try:
+            md = build_markdown(notes, video_id, title, snippets, include_transcript=args.with_transcript)
+            path = save_markdown(md, notes["title"], args.folder)
+            print(f"✓ Markdown page: {path}")
+        except Exception as e:
+            failed = True
+            print(f"✗ Markdown page failed: {e}", file=sys.stderr)
+
+    if failed:
+        # Keep the notes so nothing is lost; they can be re-published or pasted in by hand.
+        backup = Path(__file__).with_name(f"notes-{video_id}.json")
+        backup.write_text(json.dumps(notes, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"  Notes saved to {backup.name} so nothing is lost.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+    
