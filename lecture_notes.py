@@ -5,7 +5,7 @@ lecture_notes.py — turn a YouTube lecture into study notes: a Markdown page in
 Pipeline:
   1. Fetch the video's transcript (captions) from YouTube.
   2. Ask Claude to write structured notes, optionally weaving in your own notes.
-  3. Save them as photonics/<date>-<title>.md in this repo (ready to commit and push),
+  3. Save them as photonics/<date>-lec<NN>-<title>.md in this repo (ready to commit and push),
      and create a Notion page if Notion is set up. Every timestamp links back to that
      moment in the video. No transcript unless you ask.
 
@@ -474,13 +474,21 @@ def repo_root() -> Path:
     return Path.cwd()
 
 
-def save_markdown(markdown: str, title: str, folder: str) -> Path:
-    """Write <repo>/<folder>/<date>-<title>.md. Re-running the same lecture the same day overwrites it."""
+def lecture_number(video_title: str | None) -> int | None:
+    """Lecture number from a video title such as 'mod01lec03', 'Lecture 3' or 'Lec-12'."""
+    m = re.search(r"lec(?:ture)?[\s_.#-]*0*(\d+)", video_title or "", flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def save_markdown(markdown: str, title: str, folder: str, lecture: int | None = None) -> Path:
+    """Write <repo>/<folder>/<date>-lec<NN>-<title>.md (without lec<NN> when the number is unknown).
+    Re-running the same lecture the same day overwrites it."""
     from datetime import date
 
     target = repo_root() / folder.strip("/")
     target.mkdir(parents=True, exist_ok=True)
-    path = target / f"{date.today().isoformat()}-{slugify(title)}.md"
+    number = f"lec{lecture:02d}-" if lecture else ""
+    path = target / f"{date.today().isoformat()}-{number}{slugify(title)}.md"
     path.write_text(markdown, encoding="utf-8")
     return path
 
@@ -521,12 +529,15 @@ def main() -> None:
     if not args.dry_run and not (to_notion or to_markdown):
         sys.exit("Nothing to do: --no-markdown was given and Notion isn't set up in .env.")
 
+    playlist_position = None
     if args.url:
         video_id = extract_video_id(args.url)
     elif args.next:
         print("→ Looking for the next lecture in the playlist…", file=sys.stderr)
         video_ids = playlist_video_ids(args.next)[max(args.start, 1) - 1:]
         video_id = next_video_id(video_ids, repo_root() / args.folder.strip("/"))
+        if video_id is not None:
+            playlist_position = video_ids.index(video_id) + 1  # counted from --start
         if video_id is None:
             print("✓ Every lecture in the playlist already has notes; nothing to do.")
             if os.environ.get("GITHUB_OUTPUT"):  # tells the GitHub workflow to switch itself off
@@ -562,7 +573,8 @@ def main() -> None:
     if to_markdown:
         try:
             md = build_markdown(notes, video_id, title, snippets, include_transcript=args.with_transcript)
-            path = save_markdown(md, notes["title"], args.folder)
+            lecture = lecture_number(title) or playlist_position
+            path = save_markdown(md, notes["title"], args.folder, lecture)
             print(f"✓ Markdown page: {path}")
         except Exception as e:
             failed = True

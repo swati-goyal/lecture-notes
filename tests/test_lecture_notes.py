@@ -308,7 +308,7 @@ def cli(monkeypatch, tmp_path):
 
 def test_cli_writes_markdown_page(cli, tmp_path, capsys):
     cli(VIDEO_ID)
-    page = tmp_path / "photonics" / f"{date.today().isoformat()}-introduction-to-lasers.md"
+    page = tmp_path / "photonics" / f"{date.today().isoformat()}-lec01-introduction-to-lasers.md"
     assert page.exists()
     assert "✓ Markdown page" in capsys.readouterr().out
 
@@ -367,7 +367,7 @@ def test_cli_next_writes_page_for_next_lecture(cli, monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(ln, "fetch_transcript", lambda vid, langs: seen.append(vid) or SNIPPETS)
     cli("--next", "https://www.youtube.com/playlist?list=PL")  # writes notes for VIDEO_ID
-    (tmp_path / "photonics" / f"{date.today().isoformat()}-introduction-to-lasers.md").rename(
+    (tmp_path / "photonics" / f"{date.today().isoformat()}-lec01-introduction-to-lasers.md").rename(
         tmp_path / "photonics" / "lecture-1.md")
     cli("--next", "https://www.youtube.com/playlist?list=PL")
     assert seen == [VIDEO_ID, "BBBBBBBBBBB"]
@@ -407,3 +407,36 @@ def test_cli_next_start_skips_earlier_videos(cli, monkeypatch):
     monkeypatch.setattr(ln, "fetch_transcript", lambda vid, langs: seen.append(vid) or SNIPPETS)
     cli("--next", "https://www.youtube.com/playlist?list=PL", "--start", "2")
     assert seen == [VIDEO_ID]
+
+
+# --- lecture number in the page name -----------------------------------------
+
+
+@pytest.mark.parametrize("video_title, number", [
+    ("mod01lec03 — NPTEL IIT Delhi", 3),
+    ("mod12lec38 — NPTEL IIT Delhi", 38),
+    ("Lecture 7: Gaussian beams", 7),
+    ("Lec-12 Optical fibres", 12),
+    ("LECTURE_05", 5),
+    ("Intro Video — NPTEL IIT Delhi", None),
+    ("Selection rules in electric dipole transitions", None),
+    (None, None),
+])
+def test_lecture_number(video_title, number):
+    assert ln.lecture_number(video_title) == number
+
+
+def test_save_markdown_includes_lecture_number(tmp_path, monkeypatch):
+    monkeypatch.setattr(ln, "repo_root", lambda: tmp_path)
+    path = ln.save_markdown("x", "Einstein Coefficients: Emission and Absorption", "photonics", lecture=3)
+    assert path.name == f"{date.today().isoformat()}-lec03-einstein-coefficients.md"
+
+
+def test_cli_next_numbers_page_by_playlist_position_when_title_has_none(cli, monkeypatch, tmp_path):
+    monkeypatch.setattr(ln, "fetch_title", lambda vid: "Interaction of radiation — NPTEL")
+    monkeypatch.setattr(ln, "playlist_video_ids", lambda url: ["INTRO000000", "AAAAAAAAAAA", VIDEO_ID])
+    folder = tmp_path / "photonics"
+    folder.mkdir()
+    (folder / "done.md").write_text("watch?v=AAAAAAAAAAA", encoding="utf-8")
+    cli("--next", "https://www.youtube.com/playlist?list=PL", "--start", "2")
+    assert (folder / f"{date.today().isoformat()}-lec02-introduction-to-lasers.md").exists()
