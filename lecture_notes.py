@@ -26,8 +26,6 @@ Environment (put these in a .env file next to this script, or export them):
   NOTION_TOKEN            your Notion integration secret
   NOTION_PARENT_PAGE_ID   the Notion page the notes are created under
   CLAUDE_MODEL            optional; defaults to claude-sonnet-5-5
-  YT_PROXY_URL            optional; proxy for YouTube transcript requests (needed on cloud servers
-                          such as GitHub Actions, which YouTube often blocks)
 """
 
 from __future__ import annotations
@@ -87,13 +85,7 @@ def fetch_transcript(video_id: str, languages: list[str]) -> list[dict]:
     """Returns [{'text', 'start', 'duration'}, ...]. Falls back to any available language."""
     from youtube_transcript_api import YouTubeTranscriptApi
 
-    proxy = os.environ.get("YT_PROXY_URL")
-    if proxy:
-        from youtube_transcript_api.proxies import GenericProxyConfig
-
-        api = YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
-    else:
-        api = YouTubeTranscriptApi()
+    api = YouTubeTranscriptApi()
     try:
         fetched = api.fetch(video_id, languages=languages)
     except Exception:
@@ -122,11 +114,7 @@ def playlist_video_ids(playlist_url: str) -> list[str]:
     """Video IDs of a YouTube playlist, in playlist order (via yt-dlp, no API key)."""
     import yt_dlp
 
-    opts = {"extract_flat": True, "quiet": True, "no_warnings": True}
-    proxy = os.environ.get("YT_PROXY_URL")
-    if proxy:
-        opts["proxy"] = proxy
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL({"extract_flat": True, "quiet": True, "no_warnings": True}) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
     return [e["id"] for e in info.get("entries") or [] if e and e.get("id")]
 
@@ -540,9 +528,6 @@ def main() -> None:
             playlist_position = video_ids.index(video_id) + 1  # counted from --start
         if video_id is None:
             print("✓ Every lecture in the playlist already has notes; nothing to do.")
-            if os.environ.get("GITHUB_OUTPUT"):  # tells the GitHub workflow to switch itself off
-                with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-                    f.write("playlist_done=true\n")
             return
         print(f"  next lecture: https://www.youtube.com/watch?v={video_id}", file=sys.stderr)
     else:

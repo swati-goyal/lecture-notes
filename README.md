@@ -59,24 +59,7 @@ Other options:
 python lecture_notes.py --next "https://www.youtube.com/playlist?list=PLAYLIST_ID"
 ```
 
-Add `--start 2` to ignore the videos before position 2 in the playlist, such as a course intro video. This picks the first remaining video that has no page in the folder yet (a page counts if it links to that video), so running it again moves on to the following lecture. When every lecture has notes, it says so and does nothing.
-
-## Every day, automatically (GitHub Actions)
-
-[.github/workflows/daily-lecture.yml](.github/workflows/daily-lecture.yml) runs every day at 06:00 UTC. It runs the tests, writes notes for the next lecture in your playlist and commits the new page to `photonics/`. To set it up, on GitHub open the repo's **Settings → Secrets and variables → Actions**:
-
-| Where | Name | Value |
-|---|---|---|
-| Variables | `PLAYLIST_URL` | the course playlist, e.g. `https://www.youtube.com/playlist?list=…` (required) |
-| Secrets | `ANTHROPIC_API_KEY` | your Claude API key (required) |
-| Secrets | `YT_PROXY_URL` | a proxy for YouTube, e.g. `http://user:pass@host:port` (see below) |
-| Secrets | `NOTION_TOKEN`, `NOTION_PARENT_PAGE_ID` | only if you also want Notion pages |
-| Variables | `PLAYLIST_START` | playlist position to start from, e.g. `2` to skip an intro video (optional) |
-| Variables | `NOTES_FOLDER`, `CLAUDE_MODEL` | optional overrides |
-
-Then open the **Actions** tab, pick *Daily lecture notes* and press **Run workflow** once to check it works. To change the time, edit the `cron` line (it's in UTC).
-
-YouTube usually blocks transcript requests from cloud servers, GitHub's included, so the run will most likely fail with a "blocked" error unless you set `YT_PROXY_URL`. A rotating residential proxy works (Webshare's is what the transcript library recommends). GitHub also pauses scheduled workflows after 60 days without activity in the repo; the daily commits count as activity, so this only matters once the playlist is finished.
+Add `--start 2` to ignore the videos before position 2 in the playlist, such as a course intro video. This picks the first remaining video that has no page in the folder yet (a page counts if it links to that video), so running it again moves on to the following lecture. Run it once a day, then commit and push the new page. When every lecture has notes, it says so and does nothing.
 
 ## Good to know
 
