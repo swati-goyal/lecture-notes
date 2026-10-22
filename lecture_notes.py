@@ -18,12 +18,16 @@ Usage:
   python lecture_notes.py URL --folder optics             # repo folder for this run
   python lecture_notes.py URL --no-notion                 # Markdown page only this time
   python lecture_notes.py URL --dry-run                   # print notes, publish nowhere
+  python lecture_notes.py --next PLAYLIST_URL             # next playlist video without notes yet
+  python lecture_notes.py --next PLAYLIST_URL --start 2   # ...ignoring videos before position 2
 
 Environment (put these in a .env file next to this script, or export them):
   ANTHROPIC_API_KEY       your Claude API key
   NOTION_TOKEN            your Notion integration secret
   NOTION_PARENT_PAGE_ID   the Notion page the notes are created under
   CLAUDE_MODEL            optional; defaults to claude-sonnet-5-5
+  YT_PROXY_URL            optional; proxy for YouTube transcript requests (needed on cloud servers
+                          such as GitHub Actions, which YouTube often blocks)
 """
 
 from __future__ import annotations
@@ -83,7 +87,13 @@ def fetch_transcript(video_id: str, languages: list[str]) -> list[dict]:
     """Returns [{'text', 'start', 'duration'}, ...]. Falls back to any available language."""
     from youtube_transcript_api import YouTubeTranscriptApi
 
-    api = YouTubeTranscriptApi()
+    proxy = os.environ.get("YT_PROXY_URL")
+    if proxy:
+        from youtube_transcript_api.proxies import GenericProxyConfig
+
+        api = YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
+    else:
+        api = YouTubeTranscriptApi()
     try:
         fetched = api.fetch(video_id, languages=languages)
     except Exception:
@@ -106,6 +116,30 @@ def fetch_transcript(video_id: str, languages: list[str]) -> list[dict]:
             print(f"  (no {target} captions; using {fetched.language}; notes are still written in your notes language)",
                   file=sys.stderr)
     return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
+
+
+def playlist_video_ids(playlist_url: str) -> list[str]:
+    """Video IDs of a YouTube playlist, in playlist order (via yt-dlp, no API key)."""
+    import yt_dlp
+
+    opts = {"extract_flat": True, "quiet": True, "no_warnings": True}
+    proxy = os.environ.get("YT_PROXY_URL")
+    if proxy:
+        opts["proxy"] = proxy
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(playlist_url, download=False)
+    return [e["id"] for e in info.get("entries") or [] if e and e.get("id")]
+
+
+def has_notes(video_id: str, folder: Path) -> bool:
+    """True if a page in `folder` already links to this video (every page links to its lecture)."""
+    needle = f"watch?v={video_id}"
+    return folder.is_dir() and any(needle in p.read_text(encoding="utf-8") for p in folder.glob("*.md"))
+
+
+def next_video_id(video_ids: list[str], folder: Path) -> str | None:
+    """First video without a notes page yet, or None when the whole playlist is done."""
+    return next((v for v in video_ids if not has_notes(v, folder)), None)
 
 
 def fmt_ts(seconds: float) -> str:
@@ -460,7 +494,11 @@ def main() -> None:
     load_dotenv(Path(__file__).with_name(".env"))
 
     ap = argparse.ArgumentParser(description="YouTube lecture → study notes → Markdown page in this repo (+ Notion)")
-    ap.add_argument("url", help="YouTube URL or video ID")
+    ap.add_argument("url", nargs="?", help="YouTube URL or video ID")
+    ap.add_argument("--next", metavar="PLAYLIST_URL", default=os.environ.get("PLAYLIST_URL") or None,
+                    help="instead of URL: take the first video in this playlist without notes yet")
+    ap.add_argument("--start", type=int, default=int(os.environ.get("PLAYLIST_START") or 1), metavar="N",
+                    help="with --next: ignore videos before position N in the playlist, e.g. an intro (default: 1)")
     ap.add_argument("--my-notes", type=Path, help="text file with your own notes to weave in")
     ap.add_argument("--lang", nargs="+", default=["en"], help="preferred caption languages, in order (default: en)")
     ap.add_argument("--parent", default=os.environ.get("NOTION_PARENT_PAGE_ID"), help="Notion parent page ID")
@@ -483,7 +521,21 @@ def main() -> None:
     if not args.dry_run and not (to_notion or to_markdown):
         sys.exit("Nothing to do: --no-markdown was given and Notion isn't set up in .env.")
 
-    video_id = extract_video_id(args.url)
+    if args.url:
+        video_id = extract_video_id(args.url)
+    elif args.next:
+        print("→ Looking for the next lecture in the playlist…", file=sys.stderr)
+        video_ids = playlist_video_ids(args.next)[max(args.start, 1) - 1:]
+        video_id = next_video_id(video_ids, repo_root() / args.folder.strip("/"))
+        if video_id is None:
+            print("✓ Every lecture in the playlist already has notes; nothing to do.")
+            if os.environ.get("GITHUB_OUTPUT"):  # tells the GitHub workflow to switch itself off
+                with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                    f.write("playlist_done=true\n")
+            return
+        print(f"  next lecture: https://www.youtube.com/watch?v={video_id}", file=sys.stderr)
+    else:
+        ap.error("give a YouTube URL, or --next PLAYLIST_URL")
     print("→ Fetching transcript…", file=sys.stderr)
     snippets = fetch_transcript(video_id, args.lang)
     title = fetch_title(video_id)

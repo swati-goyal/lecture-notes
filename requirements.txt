@@ -1,3 +1,4 @@
 youtube-transcript-api>=1.2
 notion-client>=2.2
 anthropic>=0.40
+yt-dlp>=2025.1.1

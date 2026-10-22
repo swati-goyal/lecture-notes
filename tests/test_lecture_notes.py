@@ -328,3 +328,82 @@ def test_cli_requires_api_key(cli, monkeypatch):
 def test_cli_nothing_to_do(cli):
     with pytest.raises(SystemExit, match="Nothing to do"):
         cli(VIDEO_ID, "--no-markdown")
+
+
+# --- next lecture from a playlist -------------------------------------------
+
+
+def test_next_video_id_skips_lectures_with_notes(tmp_path):
+    folder = tmp_path / "photonics"
+    folder.mkdir()
+    (folder / "2026-10-21-introduction-to-lasers.md").write_text(
+        "**Lecture:** [x](https://www.youtube.com/watch?v=AAAAAAAAAAA)", encoding="utf-8")
+    assert ln.next_video_id(["AAAAAAAAAAA", "BBBBBBBBBBB", "CCCCCCCCCCC"], folder) == "BBBBBBBBBBB"
+    assert ln.next_video_id(["AAAAAAAAAAA"], folder) is None
+    assert ln.next_video_id(["AAAAAAAAAAA"], tmp_path / "missing") == "AAAAAAAAAAA"
+
+
+def test_playlist_video_ids_keeps_order_and_skips_gaps(monkeypatch):
+    class FakeYDL:
+        def __init__(self, opts):
+            assert opts["extract_flat"] and opts["proxy"] == "http://proxy:1"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download):
+            return {"entries": [{"id": "B"}, None, {"title": "private"}, {"id": "A"}]}
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYDL))
+    monkeypatch.setenv("YT_PROXY_URL", "http://proxy:1")
+    assert ln.playlist_video_ids("https://www.youtube.com/playlist?list=PL") == ["B", "A"]
+
+
+def test_cli_next_writes_page_for_next_lecture(cli, monkeypatch, tmp_path):
+    monkeypatch.setattr(ln, "playlist_video_ids", lambda url: [VIDEO_ID, "BBBBBBBBBBB"])
+    seen = []
+    monkeypatch.setattr(ln, "fetch_transcript", lambda vid, langs: seen.append(vid) or SNIPPETS)
+    cli("--next", "https://www.youtube.com/playlist?list=PL")  # writes notes for VIDEO_ID
+    (tmp_path / "photonics" / f"{date.today().isoformat()}-introduction-to-lasers.md").rename(
+        tmp_path / "photonics" / "lecture-1.md")
+    cli("--next", "https://www.youtube.com/playlist?list=PL")
+    assert seen == [VIDEO_ID, "BBBBBBBBBBB"]
+
+
+def test_cli_next_when_playlist_is_done(cli, monkeypatch, capsys):
+    monkeypatch.setattr(ln, "playlist_video_ids", lambda url: [])
+    cli("--next", "https://www.youtube.com/playlist?list=PL")
+    assert "nothing to do" in capsys.readouterr().out
+
+
+def test_cli_needs_url_or_playlist(cli, monkeypatch):
+    monkeypatch.delenv("PLAYLIST_URL", raising=False)
+    with pytest.raises(SystemExit):
+        cli()
+
+
+def test_cli_next_signals_github_when_playlist_is_done(cli, monkeypatch, tmp_path):
+    out = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setattr(ln, "playlist_video_ids", lambda url: [])
+    cli("--next", "https://www.youtube.com/playlist?list=PL")
+    assert out.read_text(encoding="utf-8") == "playlist_done=true\n"
+
+
+def test_cli_next_does_not_signal_while_lectures_remain(cli, monkeypatch, tmp_path):
+    out = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setattr(ln, "playlist_video_ids", lambda url: [VIDEO_ID])
+    cli("--next", "https://www.youtube.com/playlist?list=PL")
+    assert not out.exists()
+
+
+def test_cli_next_start_skips_earlier_videos(cli, monkeypatch):
+    monkeypatch.setattr(ln, "playlist_video_ids", lambda url: ["INTRO000000", VIDEO_ID])
+    seen = []
+    monkeypatch.setattr(ln, "fetch_transcript", lambda vid, langs: seen.append(vid) or SNIPPETS)
+    cli("--next", "https://www.youtube.com/playlist?list=PL", "--start", "2")
+    assert seen == [VIDEO_ID]
